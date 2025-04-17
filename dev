@@ -1,4 +1,103 @@
-Hello Team
+# Set Variables
+$ServerInstance = "PRIMARY-UAT-01\XPEDEON"
+$DatabasesToExclude = @("master", "tempdb", "model", "msdb", "distribution")
+$BackupFolder = "E:\DB_Backup\primary-uat-01"
+$LogFilePath = "E:\DB_Backup\full_db_backup_output_log.txt"
+$CloudBucket = "jnb-uat-db-dackup"  # GCP bucket name
+$Today = Get-Date -Format "yyyy/MM/dd"
+$Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$CloudPath = "gs://$CloudBucket/primary_uat_01/Full DB Backup/$Today/"  # Organized folder structure
+$BackupFailures = @()
 
+# Ensure Backup Folder Exists
+if (!(Test-Path $BackupFolder)) {
+    New-Item -ItemType Directory -Path $BackupFolder -Force
+}
 
+# Clear Previous Log
+Set-Content -Path $LogFilePath -Value ""
 
+# Construct SQL Query Excluding Specified Databases
+$Query = "SELECT name FROM sys.databases WHERE name NOT IN ('" + ($DatabasesToExclude -join "','") + "')"
+
+# Define the connection string
+$ConnectionString = "Server=$ServerInstance;Integrated Security=True;TrustServerCertificate=True;"
+
+# Retrieve List of Databases Excluding System Databases
+$Databases = Invoke-SqlCmd -ConnectionString $ConnectionString -Query $Query
+
+# Backup Each Database in Compressed Format
+foreach ($database in $Databases) {
+    try {
+        $BackupFilePath = Join-Path -Path $BackupFolder -ChildPath "$($database.name)_$Timestamp.bak"
+        
+        # Debugging Output
+        Write-Host "Backing up and compressing database: $($database.name) to $BackupFilePath"
+        Add-Content -Path $LogFilePath -Value "Backing up and compressing database: $($database.name) to $BackupFilePath"
+
+        $StartTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+        # Perform the backup
+        Backup-SqlDatabase -ServerInstance $ServerInstance -Database $database.name -BackupFile $BackupFilePath -CompressionOption On
+
+        $EndTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        Add-Content -Path $LogFilePath -Value "Backup completed for '$($database.name)' | Start: $StartTime | End: $EndTime"
+    }
+    catch {
+        $ErrorMessage = " Backup failed for '$($database.name)' at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`nError: $($_.Exception.Message)"
+        Add-Content -Path $LogFilePath -Value $ErrorMessage
+        $BackupFailures += $database.name
+    }
+}
+
+# Move Backups to GCP Storage in the correct path format
+$BackupFiles = Get-ChildItem -Path $BackupFolder -Filter "*.bak"
+foreach ($File in $BackupFiles) {
+    try {
+        $FilePath = $File.FullName
+        $FileName = $File.Name
+        $GCPPath = "$CloudPath$FileName"
+
+        # Upload to GCP Storage
+        Write-Host "Uploading $FileName to GCP Bucket Path: $GCPPath..."
+        Add-Content -Path $LogFilePath -Value "Uploading $FileName to GCP Bucket Path: $GCPPath..."
+
+        $UploadResult = Start-Process -FilePath "gsutil" -ArgumentList "cp `"$FilePath`" `"$GCPPath`"" -Wait -NoNewWindow -PassThru
+
+        if ($UploadResult.ExitCode -eq 0) {
+            # Delete file after successful upload
+            Remove-Item -Path $FilePath -Force
+            Write-Host " Successfully uploaded and deleted: $FileName"
+            Add-Content -Path $LogFilePath -Value " Successfully uploaded and deleted: $FileName"
+        } else {
+            Write-Host " Upload failed for $FileName"
+            Add-Content -Path $LogFilePath -Value " Upload failed for $FileName"
+        }
+    }
+    catch {
+        $ErrorMessage = " Error uploading '$FileName' to GCP Storage at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`nError: $($_.Exception.Message)"
+        Add-Content -Path $LogFilePath -Value $ErrorMessage
+    }
+}
+
+# Final Status Message
+if ($BackupFailures.Count -gt 0) {
+    Add-Content -Path $LogFilePath -Value " Backup completed with errors for: $($BackupFailures -join ', ')"
+} else {
+    Add-Content -Path $LogFilePath -Value " All databases backed up and uploaded successfully!"
+}
+
+# AWS SNS Notification
+$SnsTopicArn = "arn:aws:sns:us-east-1:661907950294:Algo-DB-Backup-Alert"
+
+# Construct Notification Subject
+$NotificationSubject = "Full Database Backup - primary-uat-01"
+
+# Read the content of the log file as the notification message
+$NotificationMessage = Get-Content -Path $LogFilePath | Out-String
+
+# Send Notification via AWS SNS
+aws sns publish --topic-arn $SnsTopicArn --subject $NotificationSubject --message "$NotificationMessage"
+
+# Console Output
+Write-Host "Database Backup & Cloud Upload Process Completed. Check log: $LogFilePath"
